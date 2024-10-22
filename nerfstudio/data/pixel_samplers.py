@@ -107,6 +107,7 @@ class PixelSampler:
                     c, y, x = (i.flatten() for i in torch.split(indices, 1, dim=-1))
                     chosen_indices_validity = mask[..., 0][c, y, x].bool()
                     num_valid = int(torch.sum(chosen_indices_validity).item())
+                    #change the ratio for sampling within mask
                     if num_valid == batch_size:
                         break
                     else:

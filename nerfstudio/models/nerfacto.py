@@ -57,7 +57,7 @@ class NerfactoModelConfig(ModelConfig):
     """How far along the ray to start sampling."""
     far_plane: float = 1000.0
     """How far along the ray to stop sampling."""
-    background_color: Literal["random", "last_sample", "black", "white"] = "last_sample"
+    background_color: Literal["random", "last_sample", "black", "white"] = "random"
     """Whether to randomize the background color."""
     hidden_dim: int = 64
     """Dimension of hidden layers"""
@@ -369,10 +369,14 @@ class NerfactoModel(Model):
             gt_image=image,
         )
 
-        loss_dict["rgb_loss"] = self.rgb_loss(gt_rgb, pred_rgb)
+        mask = batch["mask"].to(self.device).squeeze()
+        loss_dict["rgb_loss"] = self.rgb_loss(gt_rgb[mask], pred_rgb[mask])
+        loss_dict["accum_loss"] = torch.mean(outputs["accumulation"] * (~mask)) * 0.01
         if self.training:
             loss_dict["interlevel_loss"] = self.config.interlevel_loss_mult * interlevel_loss(
-                outputs["weights_list"], outputs["ray_samples_list"]
+                # outputs["weights_list"] [num_rays, num_samples/ray, ...]
+                [weight[mask] for weight in outputs["weights_list"]], 
+                [weight[mask] for weight in outputs["ray_samples_list"]]
             )
             assert metrics_dict is not None and "distortion" in metrics_dict
             loss_dict["distortion_loss"] = self.config.distortion_loss_mult * metrics_dict["distortion"]
