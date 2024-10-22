@@ -64,10 +64,18 @@ class PixelSampler:
         self.kwargs = kwargs
         self.config = config
         # Possibly override some values if they are present in the kwargs dictionary
-        self.config.num_rays_per_batch = self.kwargs.get("num_rays_per_batch", self.config.num_rays_per_batch)
-        self.config.keep_full_image = self.kwargs.get("keep_full_image", self.config.keep_full_image)
-        self.config.is_equirectangular = self.kwargs.get("is_equirectangular", self.config.is_equirectangular)
-        self.config.fisheye_crop_radius = self.kwargs.get("fisheye_crop_radius", self.config.fisheye_crop_radius)
+        self.config.num_rays_per_batch = self.kwargs.get(
+            "num_rays_per_batch", self.config.num_rays_per_batch
+        )
+        self.config.keep_full_image = self.kwargs.get(
+            "keep_full_image", self.config.keep_full_image
+        )
+        self.config.is_equirectangular = self.kwargs.get(
+            "is_equirectangular", self.config.is_equirectangular
+        )
+        self.config.fisheye_crop_radius = self.kwargs.get(
+            "fisheye_crop_radius", self.config.fisheye_crop_radius
+        )
         self.set_num_rays_per_batch(self.config.num_rays_per_batch)
 
     def set_num_rays_per_batch(self, num_rays_per_batch: int):
@@ -77,6 +85,63 @@ class PixelSampler:
             num_rays_per_batch: number of rays to sample per batch
         """
         self.num_rays_per_batch = num_rays_per_batch
+
+    def rejection_sample_mask(
+        self,
+        mask: Tensor,
+        num_samples: int,
+        num_images: int,
+        image_height: int,
+        image_width: int,
+        device: Union[torch.device, str],
+    ) -> Int[Tensor, "batch_size 3"]:
+        """
+        Samples pixels within a mask using rejection sampling.
+
+        Args:
+            mask: mask of possible pixels in an image to sample from.
+            num_samples: number of samples.
+            num_images: number of images to sample over.
+            image_height: the height of the image.
+            image_width: the width of the image.
+            device: device that the samples should be on.
+        """
+        indices = (
+            torch.rand((num_samples, 3), device=device)
+            * torch.tensor([num_images, image_height, image_width], device=device)
+        ).long()
+
+        num_valid = 0
+        for _ in range(self.config.max_num_iterations):
+            c, y, x = (i.flatten() for i in torch.split(indices, 1, dim=-1))
+            chosen_indices_validity = mask.squeeze()[c, y, x].bool()
+            num_valid = int(torch.sum(chosen_indices_validity).item())
+            if num_valid == num_samples:
+                break
+            else:
+                replacement_indices = (
+                    torch.rand((num_samples - num_valid, 3), device=device)
+                    * torch.tensor(
+                        [num_images, image_height, image_width], device=device
+                    )
+                ).long()
+                indices[~chosen_indices_validity] = replacement_indices
+
+        if num_valid != num_samples:
+            warnings.warn(
+                """
+                Masked sampling failed, mask is either empty or mostly empty.
+                Reverting behavior to non-rejection sampling. Consider setting
+                pipeline.datamanager.pixel-sampler.rejection-sample-mask to False
+                or increasing pipeline.datamanager.pixel-sampler.max-num-iterations
+                """
+            )
+            self.config.rejection_sample_mask = False
+            nonzero_indices = torch.nonzero(mask.squeeze(), as_tuple=False).to(device)
+            chosen_indices = random.sample(range(len(nonzero_indices)), k=num_samples)
+            indices = nonzero_indices[chosen_indices]
+
+        return indices
 
     def sample_method(
         self,
@@ -95,11 +160,6 @@ class PixelSampler:
             num_images: number of images to sample over
             mask: mask of possible pixels in an image to sample from.
         """
-        indices = (
-            torch.rand((batch_size, 3), device=device)
-            * torch.tensor([num_images, image_height, image_width], device=device)
-        ).long()
-
         if isinstance(mask, torch.Tensor) and not self.config.ignore_mask:
             if self.config.rejection_sample_mask:
                 num_valid = 0
@@ -107,13 +167,15 @@ class PixelSampler:
                     c, y, x = (i.flatten() for i in torch.split(indices, 1, dim=-1))
                     chosen_indices_validity = mask[..., 0][c, y, x].bool()
                     num_valid = int(torch.sum(chosen_indices_validity).item())
-                    #change the ratio for sampling within mask
+                    # change the ratio for sampling within mask
                     if num_valid == batch_size:
                         break
                     else:
                         replacement_indices = (
                             torch.rand((batch_size - num_valid, 3), device=device)
-                            * torch.tensor([num_images, image_height, image_width], device=device)
+                            * torch.tensor(
+                                [num_images, image_height, image_width], device=device
+                            )
                         ).long()
                         indices[~chosen_indices_validity] = replacement_indices
 
@@ -128,12 +190,21 @@ class PixelSampler:
                     )
                     self.config.rejection_sample_mask = False
                     nonzero_indices = torch.nonzero(mask[..., 0], as_tuple=False)
-                    chosen_indices = random.sample(range(len(nonzero_indices)), k=batch_size)
+                    chosen_indices = random.sample(
+                        range(len(nonzero_indices)), k=batch_size
+                    )
                     indices = nonzero_indices[chosen_indices]
             else:
                 nonzero_indices = torch.nonzero(mask[..., 0], as_tuple=False)
-                chosen_indices = random.sample(range(len(nonzero_indices)), k=batch_size)
+                chosen_indices = random.sample(
+                    range(len(nonzero_indices)), k=batch_size
+                )
                 indices = nonzero_indices[chosen_indices]
+        else:
+            indices = (
+                torch.rand((batch_size, 3), device=device)
+                * torch.tensor([num_images, image_height, image_width], device=device)
+            ).long()
 
         return indices
 
@@ -151,14 +222,23 @@ class PixelSampler:
             # sampling weight to the poles of the image than the equators.
             # TODO(kevinddchen): implement the correct mask-sampling method.
 
-            indices = self.sample_method(batch_size, num_images, image_height, image_width, mask=mask, device=device)
+            indices = self.sample_method(
+                batch_size,
+                num_images,
+                image_height,
+                image_width,
+                mask=mask,
+                device=device,
+            )
         else:
             # We sample theta uniformly in [0, 2*pi]
             # We sample phi in [0, pi] according to the PDF f(phi) = sin(phi) / 2.
             # This is done by inverse transform sampling.
             # http://corysimon.github.io/articles/uniformdistn-on-sphere/
             num_images_rand = torch.rand(batch_size, device=device)
-            phi_rand = torch.acos(1 - 2 * torch.rand(batch_size, device=device)) / torch.pi
+            phi_rand = (
+                torch.acos(1 - 2 * torch.rand(batch_size, device=device)) / torch.pi
+            )
             theta_rand = torch.rand(batch_size, device=device)
             indices = torch.floor(
                 torch.stack((num_images_rand, phi_rand, theta_rand), dim=-1)
@@ -177,13 +257,24 @@ class PixelSampler:
         device: Union[torch.device, str] = "cpu",
     ) -> Int[Tensor, "batch_size 3"]:
         if isinstance(mask, torch.Tensor) and not self.config.ignore_mask:
-            indices = self.sample_method(batch_size, num_images, image_height, image_width, mask=mask, device=device)
+            indices = self.sample_method(
+                batch_size,
+                num_images,
+                image_height,
+                image_width,
+                mask=mask,
+                device=device,
+            )
         else:
             # Rejection sampling.
             valid: Optional[torch.Tensor] = None
             indices = None
             while True:
-                samples_needed = batch_size if valid is None else int(batch_size - torch.sum(valid).item())
+                samples_needed = (
+                    batch_size
+                    if valid is None
+                    else int(batch_size - torch.sum(valid).item())
+                )
 
                 # Check if done!
                 if samples_needed == 0:
@@ -198,7 +289,14 @@ class PixelSampler:
                 x = (radii * torch.cos(theta) + image_width // 2).long()
                 y = (radii * torch.sin(theta) + image_height // 2).long()
                 sampled_indices = torch.stack(
-                    [torch.randint(0, num_images, size=(samples_needed,), device=device), y, x], dim=-1
+                    [
+                        torch.randint(
+                            0, num_images, size=(samples_needed,), device=device
+                        ),
+                        y,
+                        x,
+                    ],
+                    dim=-1,
                 )
 
                 # Update indices.
@@ -225,7 +323,9 @@ class PixelSampler:
         assert indices.shape == (batch_size, 3)
         return indices
 
-    def collate_image_dataset_batch(self, batch: Dict, num_rays_per_batch: int, keep_full_image: bool = False):
+    def collate_image_dataset_batch(
+        self, batch: Dict, num_rays_per_batch: int, keep_full_image: bool = False
+    ):
         """
         Operates on a batch of images and samples pixels to use for generating rays.
         Returns a collated batch which is input to the Graph.
@@ -243,32 +343,63 @@ class PixelSampler:
         if "mask" in batch:
             if self.config.is_equirectangular:
                 indices = self.sample_method_equirectangular(
-                    num_rays_per_batch, num_images, image_height, image_width, mask=batch["mask"], device=device
+                    num_rays_per_batch,
+                    num_images,
+                    image_height,
+                    image_width,
+                    mask=batch["mask"],
+                    device=device,
                 )
             elif self.config.fisheye_crop_radius is not None:
                 indices = self.sample_method_fisheye(
-                    num_rays_per_batch, num_images, image_height, image_width, mask=batch["mask"], device=device
+                    num_rays_per_batch,
+                    num_images,
+                    image_height,
+                    image_width,
+                    mask=batch["mask"],
+                    device=device,
                 )
             else:
                 indices = self.sample_method(
-                    num_rays_per_batch, num_images, image_height, image_width, mask=batch["mask"], device=device
+                    num_rays_per_batch,
+                    num_images,
+                    image_height,
+                    image_width,
+                    mask=batch["mask"],
+                    device=device,
                 )
         else:
             if self.config.is_equirectangular:
                 indices = self.sample_method_equirectangular(
-                    num_rays_per_batch, num_images, image_height, image_width, device=device
+                    num_rays_per_batch,
+                    num_images,
+                    image_height,
+                    image_width,
+                    device=device,
                 )
             elif self.config.fisheye_crop_radius is not None:
                 indices = self.sample_method_fisheye(
-                    num_rays_per_batch, num_images, image_height, image_width, device=device
+                    num_rays_per_batch,
+                    num_images,
+                    image_height,
+                    image_width,
+                    device=device,
                 )
             else:
-                indices = self.sample_method(num_rays_per_batch, num_images, image_height, image_width, device=device)
+                indices = self.sample_method(
+                    num_rays_per_batch,
+                    num_images,
+                    image_height,
+                    image_width,
+                    device=device,
+                )
 
         c, y, x = (i.flatten() for i in torch.split(indices, 1, dim=-1))
         c, y, x = c.cpu(), y.cpu(), x.cpu()
         collated_batch = {
-            key: value[c, y, x] for key, value in batch.items() if key != "image_idx" and value is not None
+            key: value[c, y, x]
+            for key, value in batch.items()
+            if key != "image_idx" and value is not None
         }
         assert collated_batch["image"].shape[0] == num_rays_per_batch
 
@@ -280,7 +411,9 @@ class PixelSampler:
 
         return collated_batch
 
-    def collate_image_dataset_batch_list(self, batch: Dict, num_rays_per_batch: int, keep_full_image: bool = False):
+    def collate_image_dataset_batch_list(
+        self, batch: Dict, num_rays_per_batch: int, keep_full_image: bool = False
+    ):
         """
         Does the same as collate_image_dataset_batch, except it will operate over a list of images / masks inside
         a list.
@@ -311,26 +444,39 @@ class PixelSampler:
                 image_height, image_width, _ = batch["image"][i].shape
 
                 indices = self.sample_method(
-                    num_rays, 1, image_height, image_width, mask=batch["mask"][i].unsqueeze(0), device=device
+                    num_rays,
+                    1,
+                    image_height,
+                    image_width,
+                    mask=batch["mask"][i].unsqueeze(0),
+                    device=device,
                 )
                 indices[:, 0] = i
                 all_indices.append(indices)
                 all_images.append(batch["image"][i][indices[:, 1], indices[:, 2]])
                 if "depth_image" in batch:
-                    all_depth_images.append(batch["depth_image"][i][indices[:, 1], indices[:, 2]])
+                    all_depth_images.append(
+                        batch["depth_image"][i][indices[:, 1], indices[:, 2]]
+                    )
 
         else:
             for i, num_rays in enumerate(num_rays_per_image):
                 image_height, image_width, _ = batch["image"][i].shape
                 if self.config.is_equirectangular:
-                    indices = self.sample_method_equirectangular(num_rays, 1, image_height, image_width, device=device)
+                    indices = self.sample_method_equirectangular(
+                        num_rays, 1, image_height, image_width, device=device
+                    )
                 else:
-                    indices = self.sample_method(num_rays, 1, image_height, image_width, device=device)
+                    indices = self.sample_method(
+                        num_rays, 1, image_height, image_width, device=device
+                    )
                 indices[:, 0] = i
                 all_indices.append(indices)
                 all_images.append(batch["image"][i][indices[:, 1], indices[:, 2]])
                 if "depth_image" in batch:
-                    all_depth_images.append(batch["depth_image"][i][indices[:, 1], indices[:, 2]])
+                    all_depth_images.append(
+                        batch["depth_image"][i][indices[:, 1], indices[:, 2]]
+                    )
 
         indices = torch.cat(all_indices, dim=0)
 
@@ -338,7 +484,8 @@ class PixelSampler:
         collated_batch = {
             key: value[c, y, x]
             for key, value in batch.items()
-            if key not in ("image_idx", "image", "mask", "depth_image") and value is not None
+            if key not in ("image_idx", "image", "mask", "depth_image")
+            and value is not None
         }
 
         collated_batch["image"] = torch.cat(all_images, dim=0)
@@ -363,13 +510,19 @@ class PixelSampler:
             image_batch: batch of images to sample from
         """
         if isinstance(image_batch["image"], list):
-            image_batch = dict(image_batch.items())  # copy the dictionary so we don't modify the original
+            image_batch = dict(
+                image_batch.items()
+            )  # copy the dictionary so we don't modify the original
             pixel_batch = self.collate_image_dataset_batch_list(
-                image_batch, self.num_rays_per_batch, keep_full_image=self.config.keep_full_image
+                image_batch,
+                self.num_rays_per_batch,
+                keep_full_image=self.config.keep_full_image,
             )
         elif isinstance(image_batch["image"], torch.Tensor):
             pixel_batch = self.collate_image_dataset_batch(
-                image_batch, self.num_rays_per_batch, keep_full_image=self.config.keep_full_image
+                image_batch,
+                self.num_rays_per_batch,
+                keep_full_image=self.config.keep_full_image,
             )
         else:
             raise ValueError("image_batch['image'] must be a list or torch.Tensor")
@@ -385,6 +538,10 @@ class PatchPixelSamplerConfig(PixelSamplerConfig):
     patch_size: int = 32
     """Side length of patch. This must be consistent in the method
     config in order for samples to be reshaped into patches correctly."""
+    rejection_sample_mask: bool = True
+    """Whether or not to use rejection sampling when sampling images with masks"""
+    max_num_iterations: int = 100
+    """If rejection sampling masks, the maximum number of times to sample"""
 
 
 class PatchPixelSampler(PixelSampler):
@@ -407,7 +564,9 @@ class PatchPixelSampler(PixelSampler):
         Args:
             num_rays_per_batch: number of rays to sample per batch
         """
-        self.num_rays_per_batch = (num_rays_per_batch // (self.config.patch_size**2)) * (self.config.patch_size**2)
+        self.num_rays_per_batch = (
+            num_rays_per_batch // (self.config.patch_size**2)
+        ) * (self.config.patch_size**2)
 
     # overrides base method
     def sample_method(
@@ -422,10 +581,23 @@ class PatchPixelSampler(PixelSampler):
         if isinstance(mask, Tensor) and not self.config.ignore_mask:
             sub_bs = batch_size // (self.config.patch_size**2)
             half_patch_size = int(self.config.patch_size / 2)
-            m = erode_mask(mask.permute(0, 3, 1, 2).float(), pixel_radius=half_patch_size)
-            nonzero_indices = torch.nonzero(m[:, 0], as_tuple=False).to(device)
-            chosen_indices = random.sample(range(len(nonzero_indices)), k=sub_bs)
-            indices = nonzero_indices[chosen_indices]
+            m = erode_mask(
+                mask.permute(0, 3, 1, 2).float(), pixel_radius=half_patch_size
+            )
+
+            if self.config.rejection_sample_mask:
+                indices = self.rejection_sample_mask(
+                    mask=m,
+                    num_samples=sub_bs,
+                    num_images=num_images,
+                    image_height=image_height,
+                    image_width=image_width,
+                    device=device,
+                )
+            else:
+                nonzero_indices = torch.nonzero(m[:, 0], as_tuple=False).to(device)
+                chosen_indices = random.sample(range(len(nonzero_indices)), k=sub_bs)
+                indices = nonzero_indices[chosen_indices]
 
             indices = (
                 indices.view(sub_bs, 1, 1, 3)
@@ -434,7 +606,8 @@ class PatchPixelSampler(PixelSampler):
             )
 
             yys, xxs = torch.meshgrid(
-                torch.arange(self.config.patch_size, device=device), torch.arange(self.config.patch_size, device=device)
+                torch.arange(self.config.patch_size, device=device),
+                torch.arange(self.config.patch_size, device=device),
             )
             indices[:, ..., 1] += yys - half_patch_size
             indices[:, ..., 2] += xxs - half_patch_size
@@ -444,7 +617,11 @@ class PatchPixelSampler(PixelSampler):
         else:
             sub_bs = batch_size // (self.config.patch_size**2)
             indices = torch.rand((sub_bs, 3), device=device) * torch.tensor(
-                [num_images, image_height - self.config.patch_size, image_width - self.config.patch_size],
+                [
+                    num_images,
+                    image_height - self.config.patch_size,
+                    image_width - self.config.patch_size,
+                ],
                 device=device,
             )
 
@@ -455,7 +632,8 @@ class PatchPixelSampler(PixelSampler):
             )
 
             yys, xxs = torch.meshgrid(
-                torch.arange(self.config.patch_size, device=device), torch.arange(self.config.patch_size, device=device)
+                torch.arange(self.config.patch_size, device=device),
+                torch.arange(self.config.patch_size, device=device),
             )
             indices[:, ..., 1] += yys
             indices[:, ..., 2] += xxs
@@ -474,6 +652,10 @@ class PairPixelSamplerConfig(PixelSamplerConfig):
     """Target class to instantiate."""
     radius: int = 2
     """max distance between pairs of pixels."""
+    rejection_sample_mask: bool = True
+    """Whether or not to use rejection sampling when sampling images with masks"""
+    max_num_iterations: int = 100
+    """If rejection sampling masks, the maximum number of times to sample"""
 
 
 class PairPixelSampler(PixelSampler):  # pylint: disable=too-few-public-methods
@@ -509,20 +691,51 @@ class PairPixelSampler(PixelSampler):  # pylint: disable=too-few-public-methods
 
         if isinstance(mask, Tensor) and not self.config.ignore_mask:
             m = erode_mask(mask.permute(0, 3, 1, 2).float(), pixel_radius=self.radius)
-            nonzero_indices = torch.nonzero(m[:, 0], as_tuple=False).to(device)
-            chosen_indices = random.sample(range(len(nonzero_indices)), k=rays_to_sample)
-            indices = nonzero_indices[chosen_indices]
+
+            if self.config.rejection_sample_mask:
+                indices = self.rejection_sample_mask(
+                    mask=m,
+                    num_samples=rays_to_sample,
+                    num_images=num_images,
+                    image_height=image_height,
+                    image_width=image_width,
+                    device=device,
+                )
+            else:
+                nonzero_indices = torch.nonzero(m[:, 0], as_tuple=False).to(device)
+                chosen_indices = random.sample(
+                    range(len(nonzero_indices)), k=rays_to_sample
+                )
+                indices = nonzero_indices[chosen_indices]
         else:
             s = (rays_to_sample, 1)
             ns = torch.randint(0, num_images, s, dtype=torch.long, device=device)
-            hs = torch.randint(self.radius, image_height - self.radius, s, dtype=torch.long, device=device)
-            ws = torch.randint(self.radius, image_width - self.radius, s, dtype=torch.long, device=device)
+            hs = torch.randint(
+                self.radius,
+                image_height - self.radius,
+                s,
+                dtype=torch.long,
+                device=device,
+            )
+            ws = torch.randint(
+                self.radius,
+                image_width - self.radius,
+                s,
+                dtype=torch.long,
+                device=device,
+            )
             indices = torch.concat((ns, hs, ws), dim=1)
 
         pair_indices = torch.hstack(
             (
                 torch.zeros(rays_to_sample, 1, device=device, dtype=torch.long),
-                torch.randint(-self.radius, self.radius, (rays_to_sample, 2), device=device, dtype=torch.long),
+                torch.randint(
+                    -self.radius,
+                    self.radius,
+                    (rays_to_sample, 2),
+                    device=device,
+                    dtype=torch.long,
+                ),
             )
         )
         pair_indices += indices
