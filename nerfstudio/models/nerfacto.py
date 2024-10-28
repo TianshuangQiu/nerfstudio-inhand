@@ -368,10 +368,9 @@ class NerfactoModel(Model):
             pred_accumulation=outputs["accumulation"],
             gt_image=image,
         )
-
         mask = batch["mask"].to(self.device).squeeze()
         loss_dict["rgb_loss"] = self.rgb_loss(gt_rgb[mask], pred_rgb[mask])
-        loss_dict["accum_loss"] = torch.mean(outputs["accumulation"] * (~mask)) * 0.01
+        loss_dict["alpha_loss"] = torch.mean(outputs["accumulation"] * (~mask)) * 0.01
         if self.training:
             loss_dict["interlevel_loss"] = self.config.interlevel_loss_mult * interlevel_loss(
                 # outputs["weights_list"] [num_rays, num_samples/ray, ...]
@@ -379,7 +378,10 @@ class NerfactoModel(Model):
                 [weight[mask] for weight in outputs["ray_samples_list"]]
             )
             assert metrics_dict is not None and "distortion" in metrics_dict
-            loss_dict["distortion_loss"] = self.config.distortion_loss_mult * metrics_dict["distortion"]
+            if "alpha_loss" not in loss_dict:
+                # distortion loss contradicts alpha.
+                loss_dict["distortion_loss"] = self.config.distortion_loss_mult * metrics_dict["distortion"]
+            # loss_dict["distortion_loss"] = self.config.distortion_loss_mult * metrics_dict["distortion"]
             if self.config.predict_normals:
                 # orientation loss for computed normals
                 loss_dict["orientation_loss"] = self.config.orientation_loss_mult * torch.mean(
