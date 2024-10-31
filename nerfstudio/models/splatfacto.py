@@ -182,9 +182,10 @@ class SplatfactoModelConfig(ModelConfig):
     """stop culling/splitting at this step WRT screen size of gaussians"""
     random_init: bool = False
     """whether to initialize the positions uniformly randomly (not SFM points)"""
-    num_random: int = 50000
+    #TODO: change values
+    num_random: int = 100
     """Number of gaussians to initialize if random init is used"""
-    random_scale: float = 10.0
+    random_scale: float = 0.5
     "Size of the cube to initialize random gaussians within"
     ssim_lambda: float = 0.2
     """weight of ssim loss"""
@@ -728,10 +729,14 @@ class SplatfactoModel(Model):
             scale_reg = 0.1 * scale_reg.mean()
         else:
             scale_reg = torch.tensor(0.0).to(self.device)
+        #add alpha loss
+        alpha_loss = torch.mean(outputs["accumulation"] * (mask <= 0)) * 0.01
+
 
         loss_dict = {
             "main_loss": (1 - self.config.ssim_lambda) * Ll1 + self.config.ssim_lambda * simloss,
             "scale_reg": scale_reg,
+            "alpha_loss": alpha_loss,
         }
 
         if self.training:
