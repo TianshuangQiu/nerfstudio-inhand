@@ -31,15 +31,21 @@ try:
     from gsplat.rendering import rasterization
 except ImportError:
     print("Please install gsplat>=1.0.0")
+import torchvision
 from pytorch_msssim import SSIM
 from torch.nn import Parameter
 
-from nerfstudio.cameras.camera_optimizers import CameraOptimizer, CameraOptimizerConfig
+from nerfstudio.cameras.camera_optimizers import (CameraOptimizer,
+                                                  CameraOptimizerConfig)
 from nerfstudio.cameras.cameras import Cameras
 from nerfstudio.data.scene_box import OrientedBox
-from nerfstudio.engine.callbacks import TrainingCallback, TrainingCallbackAttributes, TrainingCallbackLocation
+from nerfstudio.engine.callbacks import (TrainingCallback,
+                                         TrainingCallbackAttributes,
+                                         TrainingCallbackLocation)
 from nerfstudio.engine.optimizers import Optimizers
-from nerfstudio.model_components.lib_bilagrid import BilateralGrid, color_correct, slice, total_variation_loss
+from nerfstudio.model_components.lib_bilagrid import (BilateralGrid,
+                                                      color_correct, slice,
+                                                      total_variation_loss)
 from nerfstudio.models.base_model import Model, ModelConfig
 from nerfstudio.utils.colors import get_color
 from nerfstudio.utils.misc import torch_compile
@@ -283,6 +289,10 @@ class SplatfactoModel(Model):
                 "opacities": opacities,
             }
         )
+        # learned_masks = torch.zeros([self.learned_masks.int(), *mask.shape])
+            #     self.learned_masks = torch.nn.Parameter(learned_masks).to(self.device)
+        self.learned_masks = torch.nn.Parameter(torch.zeros([self.num_train_data, 1024, 540]))
+        self.resize = torchvision.transforms.Resize((4096, 2160))
 
         self.camera_optimizer: CameraOptimizer = self.config.camera_optimizer.setup(
             num_cameras=self.num_train_data, device="cpu"
@@ -290,7 +300,8 @@ class SplatfactoModel(Model):
 
         # metrics
         from torchmetrics.image import PeakSignalNoiseRatio
-        from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
+        from torchmetrics.image.lpip import \
+            LearnedPerceptualImagePatchSimilarity
 
         self.psnr = PeakSignalNoiseRatio(data_range=1.0)
         self.ssim = SSIM(data_range=1.0, size_average=True, channel=3)
@@ -472,6 +483,7 @@ class SplatfactoModel(Model):
         if self.config.use_bilateral_grid:
             gps["bilateral_grid"] = list(self.bil_grids.parameters())
         self.camera_optimizer.get_param_groups(param_groups=gps)
+        gps["learned_masks"] = [self.learned_masks]
         return gps
 
     def _get_downscale_factor(self):
@@ -707,10 +719,22 @@ class SplatfactoModel(Model):
 
         # Set masked part of both ground-truth and rendered image to black.
         # This is a little bit sketchy for the SSIM loss.
+        mask = None
         if "mask" in batch:
             # batch["mask"] : [H, W, 1]
-            mask = self._downscale_if_required(batch["mask"])
-            mask = mask.to(self.device)
+            mask = batch["mask"]
+            mask = mask.float().to(self.device)
+            learned_mask = self.learned_masks[batch["image_idx"]].unsqueeze(0)
+            learned_mask = self.resize(learned_mask)
+            mask = mask + learned_mask.permute(2, 1, 0)
+            mask = torch.clamp(mask, 0.0, 1.0)
+            mask = self._downscale_if_required(mask)
+            import os
+
+            import cv2
+            epoch = self.step // self.num_train_data
+            os.makedirs(f"learned_masks/{epoch}", exist_ok=True)
+            cv2.imwrite(f"learned_masks/{epoch}/mask_{batch['image_idx']}.png", mask.cpu().detach().numpy() * 255)
             assert mask.shape[:2] == gt_img.shape[:2] == pred_img.shape[:2]
             gt_img = gt_img * mask
             pred_img = pred_img * mask
@@ -729,9 +753,11 @@ class SplatfactoModel(Model):
             scale_reg = 0.1 * scale_reg.mean()
         else:
             scale_reg = torch.tensor(0.0).to(self.device)
-        #add alpha loss
-        alpha_loss = torch.mean(outputs["accumulation"] * (mask <= 0)) * 0.01
-
+            
+        alpha_loss = torch.tensor(0.0).to(self.device)
+        if mask is not None:
+            #add alpha loss
+            alpha_loss = torch.mean(outputs["accumulation"] * (1-mask)) * 0.01
 
         loss_dict = {
             "main_loss": (1 - self.config.ssim_lambda) * Ll1 + self.config.ssim_lambda * simloss,
