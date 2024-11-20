@@ -289,9 +289,8 @@ class SplatfactoModel(Model):
                 "opacities": opacities,
             }
         )
-        # learned_masks = torch.zeros([self.learned_masks.int(), *mask.shape])
-            #     self.learned_masks = torch.nn.Parameter(learned_masks).to(self.device)
         self.learned_masks = torch.nn.Parameter(torch.zeros([self.num_train_data, 1024, 540]))
+        self.learned_background = torch.nn.Parameter(torch.zeros([2160, 4096, 3]))
         self.resize = torchvision.transforms.Resize((4096, 2160))
 
         self.camera_optimizer: CameraOptimizer = self.config.camera_optimizer.setup(
@@ -484,6 +483,7 @@ class SplatfactoModel(Model):
             gps["bilateral_grid"] = list(self.bil_grids.parameters())
         self.camera_optimizer.get_param_groups(param_groups=gps)
         gps["learned_masks"] = [self.learned_masks]
+        gps["learned_background"] = [self.learned_background]
         return gps
 
     def _get_downscale_factor(self):
@@ -733,11 +733,19 @@ class SplatfactoModel(Model):
 
             import cv2
             epoch = self.step // self.num_train_data
-            os.makedirs(f"learned_masks/{epoch}", exist_ok=True)
-            cv2.imwrite(f"learned_masks/{epoch}/mask_{batch['image_idx']}.png", mask.cpu().detach().numpy() * 255)
+            if epoch % 3 == 0:
+                os.makedirs(f"learned_masks/{epoch}", exist_ok=True)
+                cv2.imwrite(f"learned_masks/{epoch}/mask_{batch['image_idx']}.png", mask.cpu().detach().numpy() * 255)
+                if batch["image_idx"] == 0:
+                    write_img = self.learned_background.cpu().detach().numpy() * 255
+                    write_img = cv2.cvtColor(write_img.astype(np.uint8), cv2.COLOR_RGB2BGR)
+                    cv2.imwrite(f"learned_masks/{epoch}.png", write_img)
             assert mask.shape[:2] == gt_img.shape[:2] == pred_img.shape[:2]
-            gt_img = gt_img * mask
-            pred_img = pred_img * mask
+            # gt_img = gt_img * mask + (1 - mask)
+            # if torch.sum(self.learned_background) == 0:
+            #     self.learned_background = torch.nn.Parameter(batch["image"].clone()/255)
+            background = self._downscale_if_required(self.learned_background)
+            pred_img = pred_img * mask + (1 - mask) * background
 
         Ll1 = torch.abs(gt_img - pred_img).mean()
         simloss = 1 - self.ssim(gt_img.permute(2, 0, 1)[None, ...], pred_img.permute(2, 0, 1)[None, ...])
