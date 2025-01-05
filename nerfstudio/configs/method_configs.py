@@ -654,7 +654,7 @@ method_configs["splatfacto"] = TrainerConfig(
             ),
         },
         "learned_masks": {
-            "optimizer": AdamOptimizerConfig(lr=0.01, eps=1e-15),
+            "optimizer": AdamOptimizerConfig(lr=0.5, eps=1e-15),
             "scheduler": ExponentialDecaySchedulerConfig(
                 lr_final=1e-5, max_steps=30000, warmup_steps=1000, lr_pre_warmup=0
             ),

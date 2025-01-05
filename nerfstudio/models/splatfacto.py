@@ -31,6 +31,9 @@ try:
     from gsplat.rendering import rasterization
 except ImportError:
     print("Please install gsplat>=1.0.0")
+import os
+
+import cv2
 import torchvision
 from pytorch_msssim import SSIM
 from torch.nn import Parameter
@@ -720,32 +723,22 @@ class SplatfactoModel(Model):
         # Set masked part of both ground-truth and rendered image to black.
         # This is a little bit sketchy for the SSIM loss.
         mask = None
+        epoch = self.step // self.num_train_data
         if "mask" in batch:
             # batch["mask"] : [H, W, 1]
             mask = batch["mask"]
             mask = mask.float().to(self.device)
-            learned_mask = self.learned_masks[batch["image_idx"]].unsqueeze(0)
-            learned_mask = self.resize(learned_mask)
-            mask = mask + learned_mask.permute(2, 1, 0)
-            mask = torch.clamp(mask, 0.0, 1.0)
+            learned_mask = torch.zeros_like(mask)
+            if epoch > 20:
+                learned_mask = self.learned_masks[batch["image_idx"]].unsqueeze(0)
+                learned_mask = self.resize(learned_mask)
+                mask = mask + learned_mask.permute(2, 1, 0)
+                mask = torch.clamp(mask, 0.0, 1.0)
             mask = self._downscale_if_required(mask)
-            import os
-
-            import cv2
-            epoch = self.step // self.num_train_data
-            if epoch % 3 == 0:
-                os.makedirs(f"learned_masks/{epoch}", exist_ok=True)
-                cv2.imwrite(f"learned_masks/{epoch}/mask_{batch['image_idx']}.png", mask.cpu().detach().numpy() * 255)
-                if batch["image_idx"] == 0:
-                    write_img = self.learned_background.cpu().detach().numpy() * 255
-                    write_img = cv2.cvtColor(write_img.astype(np.uint8), cv2.COLOR_RGB2BGR)
-                    cv2.imwrite(f"learned_masks/{epoch}.png", write_img)
             assert mask.shape[:2] == gt_img.shape[:2] == pred_img.shape[:2]
-            # gt_img = gt_img * mask + (1 - mask)
-            # if torch.sum(self.learned_background) == 0:
-            #     self.learned_background = torch.nn.Parameter(batch["image"].clone()/255)
-            background = self._downscale_if_required(self.learned_background)
-            pred_img = pred_img * mask + (1 - mask) * background
+            gt_img = gt_img * mask.detach()
+            pred_img = pred_img * mask.detach()
+
 
         Ll1 = torch.abs(gt_img - pred_img).mean()
         simloss = 1 - self.ssim(gt_img.permute(2, 0, 1)[None, ...], pred_img.permute(2, 0, 1)[None, ...])
@@ -763,14 +756,23 @@ class SplatfactoModel(Model):
             scale_reg = torch.tensor(0.0).to(self.device)
             
         alpha_loss = torch.tensor(0.0).to(self.device)
+        mask_loss = torch.tensor(0.0).to(self.device)
         if mask is not None:
             #add alpha loss
-            alpha_loss = torch.mean(outputs["accumulation"] * (1-mask)) * 0.01
-
+            alpha_loss = torch.mean(outputs["accumulation"] * (1-mask.detach())) * 0.01
+            if epoch > 20 and batch["image_idx"] == 72:
+                mask_loss = torch.abs(mask - outputs["accumulation"].detach()).mean()
+                # mask_loss += torch.abs(learned_mask).mean()
+                os.makedirs(f"learned_masks/{epoch}", exist_ok=True)
+                cv2.imwrite(f"learned_masks/{epoch}/gt_rgb_{batch['image_idx']}.png", 255*batch["image"].detach().cpu().numpy())
+                cv2.imwrite(f"learned_masks/{epoch}/mask_{batch['image_idx']}.png", 255*mask.detach().cpu().numpy())
+                cv2.imwrite(f"learned_masks/{epoch}/gt_{batch['image_idx']}.png", 255*outputs["accumulation"].detach().cpu().numpy())
+            
         loss_dict = {
             "main_loss": (1 - self.config.ssim_lambda) * Ll1 + self.config.ssim_lambda * simloss,
             "scale_reg": scale_reg,
             "alpha_loss": alpha_loss,
+            "mask_magnitude": mask_loss,
         }
 
         if self.training:
